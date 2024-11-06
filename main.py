@@ -1,15 +1,17 @@
+import os
+import io
+import cv2  # OpenCV for video processing
+import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
 from deepface import DeepFace
 from PIL import Image
-import numpy as np
-import os
-from io import BytesIO
-import json
-from typing import List, Dict
-from datetime import datetime
 from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
+from datetime import datetime
+from typing import List
+import json
+import tempfile
+import imutils
 
 app = FastAPI()
 
@@ -46,7 +48,7 @@ class FaceRecognitionSystem:
     async def process_image(self, image_data: bytes, person_folder: str):
         """Process and save a reference image."""
         try:
-            image = Image.open(BytesIO(image_data))
+            image = Image.open(io.BytesIO(image_data))
             image = image.convert('RGB')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"{timestamp}.jpg"
@@ -76,11 +78,9 @@ class FaceRecognitionSystem:
             "results": results
         }
 
-    
-
     def identify_face(self, image_data):
         """Identify faces using the stored encodings."""
-        image = Image.open(BytesIO(image_data))
+        image = Image.open(io.BytesIO(image_data))
         image = image.convert('RGB')
         image_np = np.array(image)
         
@@ -102,11 +102,66 @@ class FaceRecognitionSystem:
                     break
         
         return results or [{"name": "Unknown", "confidence": 0}]
+    
+    def identify_face_in_video(self, video_data: bytes):
+        """Identify faces in the video."""
+        
+        # Create a temporary file in memory
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
+            tmp_file.write(video_data)
+            tmp_video_path = tmp_file.name
 
+        # Open the video with OpenCV
+        cap = cv2.VideoCapture(tmp_video_path)
+        recognized_person = None
 
-    def get_statistics(self):
-        """Return stored image statistics."""
-        return {"total_people": len(self.known_faces), "people": {name: len(encodings) for name, encodings in self.known_faces.items()}}
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Resize the frame to make it easier to process (optional)
+            frame = imutils.resize(frame, width=400)
+
+            # Directly use the video frame (a NumPy array) for face recognition
+            try:
+                detected_face = DeepFace.represent(frame, model_name="Facenet", enforce_detection=True)
+                if detected_face:
+                    input_encoding = detected_face[0]["embedding"]
+                    results = []
+                    # Compare input encoding with known face encodings
+                    for name, encodings in self.known_faces.items():
+                        for ref_encoding in encodings:
+                            ref_encoding = ref_encoding[0]["embedding"]
+                            similarity = cosine_similarity([input_encoding], [ref_encoding])[0][0]
+                            if similarity > 0.8:  # Adjust threshold as needed
+                                recognized_person = name
+                                break
+                        if recognized_person:
+                                    # Release OpenCV VideoCapture
+                            cap.release()
+
+                            # Delete the temporary file after processing
+                            os.remove(tmp_video_path)
+
+                            return recognized_person
+                            break
+            except Exception as e:
+                print(e)
+                # In case no face is detected, just continue to the next frame
+                pass
+        
+        # Release OpenCV VideoCapture
+        cap.release()
+
+        # Delete the temporary file after processing
+        os.remove(tmp_video_path)
+
+        return recognized_person
+
+        def get_statistics(self):
+            """Return stored image statistics."""
+            return {"total_people": len(self.known_faces), "people": {name: len(encodings) for name, encodings in self.known_faces.items()}}
 
 # Initialize the face recognition system
 face_system = FaceRecognitionSystem()
@@ -124,6 +179,16 @@ async def identify(file: UploadFile = File(...)):
     contents = await file.read()
     results = face_system.identify_face(contents)
     return JSONResponse(content={"results": results})
+
+@app.post("/identify_video")
+async def identify_video(file: UploadFile = File(...)):
+    contents = await file.read()
+    # Identify person in the video directly from the uploaded data
+    person_name = face_system.identify_face_in_video(contents)
+    if person_name is None:
+        person_name = "Unknown"
+
+    return JSONResponse(content={"data": {"person_name": person_name}})
 
 @app.get("/statistics")
 async def get_statistics():
